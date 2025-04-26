@@ -1,118 +1,163 @@
 #!/usr/bin/env python3
 """
-Minimal ALOHA bimanual tele-op:
-  • Q-A / … / P-; : 6 DoF × 2 팔 관절 증분 제어
-  • Z/X , ,/.     : 그리퍼 완전 열기 / 완전 닫기
-  • camera        : 모델 중심 고정 FREE 카메라
+ALOHA bimanual tele-op  –  각 팔 그리퍼 분리 (2025-04-26)
+  • Q/A … P/; \|  : 6-DoF × 2 팔 관절 증분
+  • Z/X           : 왼쪽 그리퍼 열기 / 닫기
+  • ,/.           : 오른쪽 그리퍼 열기 / 닫기
+  • V             : ctrl · qpos 디버그 출력
 """
 import mujoco
 import glfw
 import numpy as np
 from pathlib import Path
 
-# ---------- 모델 로드 ----------------------------------------------------------
+# ──────────────── 모델 로드 ───────────────────────────
 XML = Path(
     "/Users/lch/development/Robot/act/assets/bimanual_viperx_transfer_cube.xml")
 model = mujoco.MjModel.from_xml_path(str(XML))
 data = mujoco.MjData(model)
 
-# ---------- GLFW 윈도우 --------------------------------------------------------
+# ──────────────── GLFW 초기화 ─────────────────────────
 if not glfw.init():
     raise RuntimeError("GLFW init failed")
 window = glfw.create_window(960, 720, "ALOHA tele-op", None, None)
 glfw.make_context_current(window)
 
-# ---------- 조인트 인덱스 ------------------------------------------------------
-J = {
-    # 왼팔 0-7
-    'L_WAIST': 0, 'L_SHOUL': 1, 'L_ELB': 2, 'L_ROLL': 3,
-    'L_WRANG': 4, 'L_WROT': 5, 'L_LF': 6, 'L_RF': 7,
-    # 오른팔 8-15
-    'R_WAIST': 8, 'R_SHOUL': 9, 'R_ELB': 10, 'R_ROLL': 11,
-    'R_WRANG': 12, 'R_WROT': 13, 'R_LF': 14, 'R_RF': 15,
+# ──────────────── 헬퍼 함수 ───────────────────────────
+
+
+def jid(n): return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)
+
+
+def aid_safe(j):
+    """조인트-ID → 액추에이터-ID (없으면 None)"""
+    idx = np.where(model.actuator_trnid[:, 0] == j)[0]
+    return int(idx[0]) if idx.size else None
+
+
+def safe_range(a):
+    lo, hi = model.actuator_ctrlrange[a]
+    return (-np.inf, np.inf) if (lo == hi == 0) else (lo, hi)
+
+# ──────────────── 주요 인덱스 구하기 ──────────────────
+
+
+def L(n): return f"vx300s_left/{n}"
+def R(n): return f"vx300s_right/{n}"
+
+
+joint_names = ["waist", "shoulder", "elbow",
+               "roll", "wrist_angle", "wrist_rotate"]
+LJ = [jid(L(n)) for n in joint_names]
+RJ = [jid(R(n)) for n in joint_names]
+
+# 각 손가락 슬라이드 (왼손·오른손 각각 2개)
+A_L_LF = aid_safe(jid(L("left_finger")))    # + 범위
+A_L_RF = aid_safe(jid(L("right_finger")))   # – 범위
+A_R_LF = aid_safe(jid(R("left_finger")))    # + 범위
+A_R_RF = aid_safe(jid(R("right_finger")))   # – 범위
+
+# ──────────────── 팔 관절 키 매핑 ─────────────────────
+DELTA = 0.10
+KEYMAP = {}
+
+
+def add_pair(kplus, kminus, j_id):
+    a = aid_safe(j_id)
+    if a is not None:
+        KEYMAP[kplus] = (a, +DELTA)
+        KEYMAP[kminus] = (a, -DELTA)
+
+
+# 왼팔 (QWERTY 왼쪽)
+keys_left = [(glfw.KEY_Q, glfw.KEY_A), (glfw.KEY_W, glfw.KEY_S),
+             (glfw.KEY_E, glfw.KEY_D), (glfw.KEY_R, glfw.KEY_F),
+             (glfw.KEY_T, glfw.KEY_G), (glfw.KEY_Y, glfw.KEY_H)]
+for (kp, km), j in zip(keys_left, LJ):
+    add_pair(kp, km, j)
+
+# 오른팔 (QWERTY 오른쪽)
+keys_right = [(glfw.KEY_U, glfw.KEY_J), (glfw.KEY_I, glfw.KEY_K),
+              (glfw.KEY_O, glfw.KEY_L), (glfw.KEY_P, glfw.KEY_SEMICOLON),
+              (glfw.KEY_LEFT_BRACKET, glfw.KEY_APOSTROPHE),
+              (glfw.KEY_RIGHT_BRACKET, glfw.KEY_BACKSLASH)]
+for (kp, km), j in zip(keys_right, RJ):
+    add_pair(kp, km, j)
+
+# ──────────────── 그리퍼 스캔코드 매핑 ────────────────
+# Mac-US 물리: Z=6 X=7 ,=43 .=47
+GRIP_SC = {
+    6:  ((A_L_LF, +0.057), (A_L_RF, -0.057)),   # 왼손 열기
+    7:  ((A_L_LF, +0.021), (A_L_RF, -0.021)),   # 왼손 닫기
+    43: ((A_R_LF, +0.057), (A_R_RF, -0.057)),   # 오른손 열기
+    47: ((A_R_LF, +0.021), (A_R_RF, -0.021)),   # 오른손 닫기
 }
 
-# ---------- 매핑: joint-id → actuator-id --------------------------------------
-JOINT2ACT = {j: a for a, (j, _) in enumerate(model.actuator_trnid) if j >= 0}
-
-# ---------- 제어 스텝 ----------------------------------------------------------
-DELTA_JOINT = 0.10        # rad
-# 그리퍼 절대 위치 (XML ctrlrange = 0.021~0.057 / -0.057~-0.021) :contentReference[oaicite:1]{index=1}
-OPEN_L, CLOSE_L = 0.057, 0.021
-OPEN_R, CLOSE_R = -0.021, -0.057
-
-KEYMAP = {
-    # 왼팔
-    glfw.KEY_Q: (J['L_WAIST'], +DELTA_JOINT), glfw.KEY_A: (J['L_WAIST'], -DELTA_JOINT),
-    glfw.KEY_W: (J['L_SHOUL'], +DELTA_JOINT), glfw.KEY_S: (J['L_SHOUL'], -DELTA_JOINT),
-    glfw.KEY_E: (J['L_ELB'],   +DELTA_JOINT), glfw.KEY_D: (J['L_ELB'],   -DELTA_JOINT),
-    glfw.KEY_R: (J['L_ROLL'],  +DELTA_JOINT), glfw.KEY_F: (J['L_ROLL'],  -DELTA_JOINT),
-    # 오른팔
-    glfw.KEY_U: (J['R_WAIST'], +DELTA_JOINT), glfw.KEY_J: (J['R_WAIST'], -DELTA_JOINT),
-    glfw.KEY_I: (J['R_SHOUL'], +DELTA_JOINT), glfw.KEY_K: (J['R_SHOUL'], -DELTA_JOINT),
-    glfw.KEY_O: (J['R_ELB'],   +DELTA_JOINT), glfw.KEY_L: (J['R_ELB'],   -DELTA_JOINT),
-    glfw.KEY_P: (J['R_ROLL'],  +DELTA_JOINT), glfw.KEY_SEMICOLON: (J['R_ROLL'], -DELTA_JOINT),
-}
-
-GRIP_KEYS = {
-    # 왼손 (Z: 열기, X: 닫기)
-    glfw.KEY_Z:  (J['L_LF'], OPEN_L,  J['L_RF'], CLOSE_R),
-    glfw.KEY_X:  (J['L_LF'], CLOSE_L, J['L_RF'], OPEN_R),
-    # 오른손 (, : 열기, . : 닫기)
-    glfw.KEY_COMMA:  (J['R_LF'], OPEN_L,  J['R_RF'], CLOSE_R),
-    glfw.KEY_PERIOD: (J['R_LF'], CLOSE_L, J['R_RF'], OPEN_R),
-}
-
-# ---------- 목표(ctrl) 버퍼 초기화 --------------------------------------------
+# ──────────────── ctrl 버퍼 & 파라미터 조정 ───────────
 target = np.zeros(model.nu)
 for a in range(model.nu):
     j = model.actuator_trnid[a, 0]
     if j >= 0:
-        target[a] = data.qpos[j]          # 현재 자세로 동기화
-mujoco.mj_forward(model, data)            # 한 프레임 일관성 갱신
+        target[a] = data.qpos[j]        # 현재 자세로 초기화
 
-# ---------- 키 콜백 -----------------------------------------------------------
+for a, rng in (
+    (A_L_LF, (0.021, 0.057)), (A_L_RF, (-0.057, -0.021)),
+        (A_R_LF, (0.021, 0.057)), (A_R_RF, (-0.057, -0.021))):
+    if a is None:
+        continue
+    model.actuator_ctrlrange[a] = rng
+    model.actuator_gainprm[a, 0] *= 8        # 기본 kp ×8 (과도증폭 방지)
+    model.actuator_forcelimited[a] = 0
+
+mujoco.mj_forward(model, data)
+
+# ──────────────── 키 콜백 ────────────────────────────
 
 
-def on_key(win, key, sc, action, mods):
-    if action not in (glfw.PRESS, glfw.REPEAT):
+def on_key(win, key, sc, act, mods):
+    if act == glfw.PRESS:
+        print(f"key {key}  sc {sc}")
+    if act not in (glfw.PRESS, glfw.REPEAT):
         return
 
-    # 그리퍼 절대 제어
-    if key in GRIP_KEYS:
-        jl, val_l, jr, val_r = GRIP_KEYS[key]
-        target[JOINT2ACT[jl]] = val_l
-        target[JOINT2ACT[jr]] = val_r
+    # 디버그 V
+    if key == glfw.KEY_V:
+        idxs = [jid(L("left_finger")), jid(R("left_finger")),
+                jid(L("right_finger")), jid(R("right_finger"))]
+        print("ctrl:", np.round(data.ctrl[[A_L_LF, A_L_RF, A_R_LF, A_R_RF]], 3),
+              " qpos:", np.round(data.qpos[idxs], 3))
         return
 
-    # 관절 증분 제어
+    # 그리퍼
+    if sc in GRIP_SC:
+        for a, v in GRIP_SC[sc]:
+            if a is None:
+                continue
+            lo, hi = safe_range(a)
+            target[a] = np.clip(v, lo, hi)
+        return
+
+    # 팔 관절
     if key in KEYMAP:
-        j, delta = KEYMAP[key]
-        a = JOINT2ACT[j]
-        # 안전 범위 :contentReference[oaicite:2]{index=2}
-        lo, hi = model.actuator_ctrlrange[a]
-        target[a] = np.clip(target[a] + delta, lo, hi)
+        a, d = KEYMAP[key]
+        lo, hi = safe_range(a)
+        target[a] = np.clip(target[a]+d, lo, hi)
 
 
 glfw.set_key_callback(window, on_key)
 
-# ---------- 카메라 ------------------------------------------------------------
+# ──────────────── 카메라 & 렌더 ───────────────────────
 ctx = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150)
 cam = mujoco.MjvCamera()
+mujoco.mjv_defaultCamera(cam)
 opt = mujoco.MjvOption()
 scene = mujoco.MjvScene(model, maxgeom=10_000)
-mujoco.mjv_defaultCamera(cam)
-
 cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-# 모델 중심 :contentReference[oaicite:3]{index=3}
 cam.lookat[:] = model.stat.center
-cam.distance = 1 * model.stat.extent
-cam.azimuth = 90
-cam.elevation = -50
+cam.distance, cam.azimuth, cam.elevation = 1.2*model.stat.extent, 90, -40
 
-# ---------- 메인 루프 ---------------------------------------------------------
+# ──────────────── 메인 루프 ──────────────────────────
 while not glfw.window_should_close(window):
-    # servo 목표 주입 (자동 clamp) :contentReference[oaicite:4]{index=4}
     data.ctrl[:] = target
     mujoco.mj_step(model, data)
 
