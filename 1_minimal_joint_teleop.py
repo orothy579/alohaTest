@@ -106,9 +106,9 @@ mujoco.mjv_defaultCamera(cam)
 cam.type = mujoco.mjtCamera.mjCAMERA_FREE
 # 모델 중심 :contentReference[oaicite:3]{index=3}
 cam.lookat[:] = model.stat.center
-cam.distance = 1.5 * model.stat.extent
+cam.distance = 1 * model.stat.extent
 cam.azimuth = 90
-cam.elevation = -20
+cam.elevation = -50
 
 # ---------- 메인 루프 ---------------------------------------------------------
 while not glfw.window_should_close(window):
