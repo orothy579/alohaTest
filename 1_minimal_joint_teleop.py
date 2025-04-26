@@ -20,7 +20,7 @@ data = mujoco.MjData(model)
 # ──────────────── GLFW 초기화 ─────────────────────────
 if not glfw.init():
     raise RuntimeError("GLFW init failed")
-window = glfw.create_window(960, 720, "ALOHA tele-op", None, None)
+window = glfw.create_window(600, 400, "ALOHA tele-op", None, None)
 glfw.make_context_current(window)
 
 # ──────────────── 헬퍼 함수 ───────────────────────────
@@ -52,10 +52,11 @@ LJ = [jid(L(n)) for n in joint_names]
 RJ = [jid(R(n)) for n in joint_names]
 
 # 각 손가락 슬라이드 (왼손·오른손 각각 2개)
-A_L_LF = aid_safe(jid(L("left_finger")))    # + 범위
-A_L_RF = aid_safe(jid(L("right_finger")))   # – 범위
-A_R_LF = aid_safe(jid(R("left_finger")))    # + 범위
-A_R_RF = aid_safe(jid(R("right_finger")))   # – 범위
+A_LL = aid_safe(jid("vx300s_left/left_finger"))
+A_LR = aid_safe(jid("vx300s_left/right_finger"))
+A_RL = aid_safe(jid("vx300s_right/left_finger"))
+A_RR = aid_safe(jid("vx300s_right/right_finger"))
+
 
 # ──────────────── 팔 관절 키 매핑 ─────────────────────
 DELTA = 0.10
@@ -86,11 +87,12 @@ for (kp, km), j in zip(keys_right, RJ):
 
 # ──────────────── 그리퍼 스캔코드 매핑 ────────────────
 # Mac-US 물리: Z=6 X=7 ,=43 .=47
+OPEN, CLOSE = 0.057, 0.021
 GRIP_SC = {
-    6:  ((A_L_LF, +0.057), (A_L_RF, -0.057)),   # 왼손 열기
-    7:  ((A_L_LF, +0.021), (A_L_RF, -0.021)),   # 왼손 닫기
-    43: ((A_R_LF, +0.057), (A_R_RF, -0.057)),   # 오른손 열기
-    47: ((A_R_LF, +0.021), (A_R_RF, -0.021)),   # 오른손 닫기
+    6: ((A_LL, OPEN), (A_LR, OPEN)),
+    7: ((A_LL, CLOSE), (A_LR, CLOSE)),
+    43: ((A_RL, OPEN), (A_RR, OPEN)),
+    47: ((A_RL, CLOSE), (A_RR, CLOSE)),
 }
 
 # ──────────────── ctrl 버퍼 & 파라미터 조정 ───────────
@@ -100,18 +102,23 @@ for a in range(model.nu):
     if j >= 0:
         target[a] = data.qpos[j]        # 현재 자세로 초기화
 
-for a, rng in (
-    (A_L_LF, (0.021, 0.057)), (A_L_RF, (-0.057, -0.021)),
-        (A_R_LF, (0.021, 0.057)), (A_R_RF, (-0.057, -0.021))):
-    if a is None:
-        continue
-    model.actuator_ctrlrange[a] = rng
-    model.actuator_gainprm[a, 0] *= 8        # 기본 kp ×8 (과도증폭 방지)
-    model.actuator_forcelimited[a] = 0
+
+for a in (A_LL, A_LR, A_RL, A_RR):
+    model.actuator_gainprm[a, 0] = 400
+    model.actuator_forcelimited[a] = 1
+    model.actuator_forcerange[a] = (-1000, 1e3)
+    model.actuator_dynprm[a, 1] = 40
+    model.actuator_ctrlrange[a] = (0.021, 0.057)
 
 mujoco.mj_forward(model, data)
 
+print("Joint range")
+print(model.jnt_range[jid("vx300s_left/left_finger")])
+
 # ──────────────── 키 콜백 ────────────────────────────
+
+GRIP_DELTA = 0.01          # 5 mm씩
+GRIP_KEYS = {6: +1, 7: -1, 43: +1, 47: -1}   # sc : 방향
 
 
 def on_key(win, key, sc, act, mods):
@@ -124,17 +131,19 @@ def on_key(win, key, sc, act, mods):
     if key == glfw.KEY_V:
         idxs = [jid(L("left_finger")), jid(R("left_finger")),
                 jid(L("right_finger")), jid(R("right_finger"))]
-        print("ctrl:", np.round(data.ctrl[[A_L_LF, A_L_RF, A_R_LF, A_R_RF]], 3),
-              " qpos:", np.round(data.qpos[idxs], 3))
+        slide_ids = [A_LL, A_LR, A_RL, A_RR]
+        print(
+            "ctrl:", np.round(data.ctrl[slide_ids], 3),
+            " qpos:", np.round(data.qpos[idxs], 3)
+        )
         return
 
     # 그리퍼
-    if sc in GRIP_SC:
-        for a, v in GRIP_SC[sc]:
-            if a is None:
-                continue
+    if sc in GRIP_KEYS:
+        sgn = GRIP_KEYS[sc]
+        for a in (A_LL, A_LR) if sc in (6, 7) else (A_RL, A_RR):
             lo, hi = safe_range(a)
-            target[a] = np.clip(v, lo, hi)
+            target[a] = np.clip(target[a] + sgn*GRIP_DELTA, lo, hi)
         return
 
     # 팔 관절
