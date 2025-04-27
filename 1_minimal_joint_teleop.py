@@ -13,9 +13,10 @@ from pathlib import Path
 
 # ──────────────── 모델 로드 ───────────────────────────
 XML = Path(
-    "/Users/lch/development/Robot/act/assets/bimanual_viperx_transfer_cube.xml")
+    "/Users/lch/development/Robot/act/assets/test.xml")
 model = mujoco.MjModel.from_xml_path(str(XML))
 data = mujoco.MjData(model)
+
 
 # ──────────────── GLFW 초기화 ─────────────────────────
 if not glfw.init():
@@ -56,6 +57,8 @@ A_LL = aid_safe(jid("vx300s_left/left_finger"))
 A_LR = aid_safe(jid("vx300s_left/right_finger"))
 A_RL = aid_safe(jid("vx300s_right/left_finger"))
 A_RR = aid_safe(jid("vx300s_right/right_finger"))
+
+print(A_LL, A_LR, A_RL, A_RR)
 
 
 # ──────────────── 팔 관절 키 매핑 ─────────────────────
@@ -104,11 +107,10 @@ for a in range(model.nu):
 
 
 for a in (A_LL, A_LR, A_RL, A_RR):
-    model.actuator_gainprm[a, 0] = 400
-    model.actuator_forcelimited[a] = 1
-    model.actuator_forcerange[a] = (-1000, 1e3)
-    model.actuator_dynprm[a, 1] = 40
-    model.actuator_ctrlrange[a] = (0.021, 0.057)
+    j = model.actuator_trnid[a, 0]           # actuator → 연결된 joint ID
+    jr = model.jnt_range[j]                  # joint의 물리적 범위 읽기
+    model.actuator_ctrlrange[a] = tuple(jr)  # ctrlrange = jnt_range
+    model.actuator_ctrllimited[a] = 1        # ctrlrange 클램핑 활성화
 
 mujoco.mj_forward(model, data)
 
@@ -117,8 +119,8 @@ print(model.jnt_range[jid("vx300s_left/left_finger")])
 
 # ──────────────── 키 콜백 ────────────────────────────
 
-GRIP_DELTA = 0.01          # 5 mm씩
-GRIP_KEYS = {6: +1, 7: -1, 43: +1, 47: -1}   # sc : 방향
+GRIP_DELTA = 0.5         # 5 mm씩
+GRIP_KEYS = {6: 1, 7: -1, 43: 1, 47: -1}   # sc : 방향
 
 
 def on_key(win, key, sc, act, mods):
@@ -127,7 +129,7 @@ def on_key(win, key, sc, act, mods):
     if act not in (glfw.PRESS, glfw.REPEAT):
         return
 
-    # 디버그 V
+    # 디버그
     if key == glfw.KEY_V:
         idxs = [jid(L("left_finger")), jid(R("left_finger")),
                 jid(L("right_finger")), jid(R("right_finger"))]
@@ -141,10 +143,14 @@ def on_key(win, key, sc, act, mods):
     # 그리퍼
     if sc in GRIP_KEYS:
         sgn = GRIP_KEYS[sc]
-        for a in (A_LL, A_LR) if sc in (6, 7) else (A_RL, A_RR):
-            lo, hi = safe_range(a)
-            target[a] = np.clip(target[a] + sgn*GRIP_DELTA, lo, hi)
-        return
+        if sc in (6, 7):  # 왼쪽
+            for a in (A_LL, A_LR):
+                lo, hi = safe_range(a)
+                target[a] = np.clip(target[a] + sgn * GRIP_DELTA, lo, hi)
+        elif sc in (43, 47):  # 오른쪽
+            for a in (A_RL, A_RR):
+                lo, hi = safe_range(a)
+                target[a] = np.clip(target[a] - sgn * GRIP_DELTA, lo, hi)
 
     # 팔 관절
     if key in KEYMAP:
