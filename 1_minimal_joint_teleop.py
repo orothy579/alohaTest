@@ -13,7 +13,7 @@ from pathlib import Path
 
 # ──────────────── 모델 로드 ───────────────────────────
 XML = Path(
-    "/Users/lch/development/Robot/act/assets/test.xml")
+    "./assets/test.xml")
 model = mujoco.MjModel.from_xml_path(str(XML))
 data = mujoco.MjData(model)
 
